@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { GLWrapper } from "@/components/r3f/GLWrapper";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -27,6 +28,9 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
+        <div className="z-[-50] fixed w-[100vw] bg-stone-950 h-[100lvh]" >
+          <GLWrapper />
+        </div>
         {children}
       </body>
     </html>

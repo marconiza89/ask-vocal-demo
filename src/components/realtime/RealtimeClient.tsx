@@ -199,7 +199,7 @@ export default function RealtimeClient() {
     }, [disconnect]);
 
     return (
-        <div style={{ display: 'grid', gap: 8 }}>
+        <div className='' style={{ display: 'grid', gap: 8 }}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
                     onClick={() =>
