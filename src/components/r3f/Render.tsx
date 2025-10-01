@@ -4,6 +4,7 @@ import { type ThreeElement } from '@react-three/fiber'
 import { Suspense, useEffect, useRef, useState } from "react";
 import { OrbitControls, Sphere, MeshDistortMaterial, Environment } from "@react-three/drei";
 import { AudioBlob } from "./AudioBlob";
+import { useAudioStore } from "./UseAudio";
 
 // import { Effects } from "./Effects";
 
@@ -11,13 +12,14 @@ import { AudioBlob } from "./AudioBlob";
 
 
 function DistortedTorusBG() {
+  const level = useAudioStore((state) => state.audioLevel);
  
   return (
     <Sphere     
       castShadow
       receiveShadow     
-      args={[1.5, 128, 128]}
-      position={[0, 0, 0]}
+      args={[1.5 * level/3 +1.5, 128, 128]}
+      position={[0, -2, 0]}
     >
       <MeshDistortMaterial
         color="#04114b"
@@ -49,7 +51,7 @@ export  function Render() {
             >
                 <Suspense fallback={null}>
                     <OrbitControls enableDamping dampingFactor={0.05} />
-                    <Environment preset="city" />
+                    <Environment preset="city" environmentIntensity={2} />
                     <ambientLight intensity={0.3} />
                     <pointLight position={[10, 10, 10]} intensity={0.5} />
                     {/* <AudioBlob /> */}

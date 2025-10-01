@@ -27,6 +27,7 @@ export default function RealtimeClient() {
     // Audio analysis refs
     const audioContextRef = useRef<AudioContext | null>(null);
     const analyserRef = useRef<AnalyserNode | null>(null);
+    const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
     const animationFrameRef = useRef<number | null>(null);
     const setAudioLevel = useAudioStore((state) => state.setAudioLevel);
 
@@ -34,92 +35,139 @@ export default function RealtimeClient() {
         setLogs(prev => [m, ...prev].slice(0, 200));
     }, []);
 
-    // Setup audio analyzer - chiamato DOPO che WebRTC è connesso
-    const setupAudioAnalyzer = useCallback(async () => {
-        // Aspetta che ci sia un srcObject valido
-        if (!audioOutRef.current?.srcObject) {
-            log('❌ No srcObject yet, retrying...');
-            setTimeout(() => setupAudioAnalyzer(), 100);
-            return;
-        }
-        
-        // Se analyzer già esiste, non ricreare
+    // Setup audio analyzer - ora usa MediaStream direttamente
+    const setupAudioAnalyzer = useCallback(async (stream: MediaStream) => {
+        // Cleanup precedente se esiste
         if (analyserRef.current) {
-            log('⚠️ Analyzer already exists');
-            return;
+            // log('⚠️ Cleaning up previous analyzer');
+            stopAudioAnalyzer();
         }
 
         try {
-            log('🎤 Creating audio analyzer...');
+            // log('🎤 Creating audio analyzer from MediaStream...');
             
-            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-            audioContextRef.current = audioContext;
-            log(`🔊 AudioContext state: ${audioContext.state}`);
+            // Verifica che lo stream abbia tracce audio
+            const audioTracks = stream.getAudioTracks();
+            if (audioTracks.length === 0) {
+                // log('❌ No audio tracks in stream');
+                return;
+            }
+            // log(`✅ Found ${audioTracks.length} audio track(s)`);
 
-            // Resume context se sospeso
+            // Crea o riusa AudioContext
+            if (!audioContextRef.current) {
+                const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+                audioContextRef.current = new AudioContextClass();
+            }
+            
+            const audioContext = audioContextRef.current;
+            
+            // Resume se necessario
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
                 // log('✅ AudioContext resumed');
             }
 
+            // Crea analyzer con settings ottimizzati per speech
             const analyser = audioContext.createAnalyser();
-            analyser.fftSize = 2048; // Più grande per time domain
-            analyser.smoothingTimeConstant = 0.8;
+            analyser.fftSize = 256; // Più piccolo per risposta più veloce
+            analyser.smoothingTimeConstant = 0.3; // Meno smoothing per più reattività
+            analyser.minDecibels = -90;
+            analyser.maxDecibels = -10;
             analyserRef.current = analyser;
 
-            // Crea source dall'elemento audio
-            const source = audioContext.createMediaElementSource(audioOutRef.current);
+            // Crea source dal MediaStream invece che dall'elemento audio
+            const source = audioContext.createMediaStreamSource(stream);
+            sourceRef.current = source;
             source.connect(analyser);
-            analyser.connect(audioContext.destination);
+            // Non connettere a destination per evitare feedback
             
-            // log('✅ Audio analyzer connected!');
+            // log('✅ Audio analyzer connected to stream!');
 
-            const bufferLength = analyser.fftSize;
+            // Buffer per l'analisi
+            const bufferLength = analyser.frequencyBinCount;
             const dataArray = new Uint8Array(bufferLength);
-            let frameCount = 0;
+            let silenceCounter = 0;
+            const SILENCE_THRESHOLD = 10; // frames di silenzio prima di settare a 0
 
             const updateVolume = () => {
                 if (!analyserRef.current) return;
                 
-                // Usa time domain invece di frequency
-                analyserRef.current.getByteTimeDomainData(dataArray);
+                // Usa frequency data che è più affidabile per il volume
+                analyserRef.current.getByteFrequencyData(dataArray);
                 
-                // Calcola RMS (Root Mean Square) per volume più accurato
+                // Calcola la media pesata (più peso alle frequenze vocali 85-255 Hz)
                 let sum = 0;
-                for (let i = 0; i < dataArray.length; i++) {
-                    const normalized = (dataArray[i] - 128) / 128; // Normalizza a -1 to 1
-                    sum += normalized * normalized;
+                let count = 0;
+                
+                // Focus sulle frequenze vocali (circa indici 2-20 per speech)
+                for (let i = 2; i < Math.min(20, dataArray.length); i++) {
+                    sum += dataArray[i];
+                    count++;
                 }
-                const rms = Math.sqrt(sum / dataArray.length);
                 
-                // Log dettagliato ogni 30 frame (circa 0.5 secondi)
-                // if (frameCount++ % 30 === 0) {
-                //     log(`📊 Time domain - RMS: ${rms.toFixed(3)}, First values: ${dataArray[0]}, ${dataArray[1]}, ${dataArray[2]}`);
-                // }
+                // Media normalizzata
+                const average = count > 0 ? (sum / count) / 255 : 0;
                 
-                // Scala il volume (RMS è di solito tra 0 e 0.5 per parlato normale)
-                const normalizedVolume = Math.min(1, rms * 3);
+                // Applica una curva per rendere il volume più naturale
+                const scaledVolume = Math.pow(average, 0.8) * 2; // Esponente < 1 per più sensibilità
+                const normalizedVolume = Math.min(1, scaledVolume);
                 
-                // Aggiorna store
-                setAudioLevel(normalizedVolume);
+                // Gestione del silenzio con isteresi
+                if (normalizedVolume < 0.01) {
+                    silenceCounter++;
+                    if (silenceCounter > SILENCE_THRESHOLD) {
+                        setAudioLevel(0);
+                    }
+                } else {
+                    silenceCounter = 0;
+                    setAudioLevel(normalizedVolume);
+                }
+                
+                // Log dettagliato ogni secondo circa
+                if (Math.random() < 0.016) { // ~1 volta al secondo a 60fps
+                    const maxValue = Math.max(...Array.from(dataArray));
+                    // log(`📊 Audio: avg=${average.toFixed(3)}, scaled=${normalizedVolume.toFixed(3)}, max=${maxValue}`);
+                }
                 
                 animationFrameRef.current = requestAnimationFrame(updateVolume);
             };
 
+            // Inizia il monitoring
             updateVolume();
-            // log('🎯 Volume monitoring active');
+            // log('🎯 Volume monitoring active on stream');
+            
         } catch (error) {
-            log(`❌ Audio analyzer error: ${error}`);
+            // log(`❌ Audio analyzer error: ${error}`);
+            console.error('Audio analyzer error:', error);
         }
     }, [log, setAudioLevel]);
 
     const stopAudioAnalyzer = useCallback(() => {
+        // Stop animation frame
         if (animationFrameRef.current !== null) {
             cancelAnimationFrame(animationFrameRef.current);
             animationFrameRef.current = null;
         }
+        
+        // Disconnect source
+        if (sourceRef.current) {
+            try {
+                sourceRef.current.disconnect();
+            } catch (e) {
+                // Ignore disconnect errors
+            }
+            sourceRef.current = null;
+        }
+        
+        // Reset analyzer
+        analyserRef.current = null;
+        
+        // Reset audio level
         setAudioLevel(0);
-    }, [setAudioLevel]);
+        
+        // log('🛑 Audio analyzer stopped');
+    }, [setAudioLevel, log]);
 
     const fetchEphemeralSession = useCallback(async (model?: string) => {
         const url = model ? `/api/realtime/session?model=${encodeURIComponent(model)}` : '/api/realtime/session';
@@ -185,31 +233,31 @@ export default function RealtimeClient() {
         if (enableAudioOut) {
             const remoteStream = new MediaStream();
             remoteStreamRef.current = remoteStream;
+            
             pc.ontrack = (event) => {
-                log('🎵 Received audio track from WebRTC');
+                log('Received audio track from WebRTC');
                 const [stream] = event.streams;
                 const tracks = stream.getAudioTracks();
-                log(`📡 Number of audio tracks: ${tracks.length}`);
+                // log(`📡 Number of audio tracks: ${tracks.length}`);
                 
                 tracks.forEach(track => {
                     remoteStream.addTrack(track);
-                    log(`🎧 Track state: ${track.readyState}, enabled: ${track.enabled}`);
+                    log(` Track state: ${track.readyState}, enabled: ${track.enabled}`);
                 });
                 
+                // Set audio element source
                 if (audioOutRef.current) {
                     audioOutRef.current.srcObject = remoteStream;
-                    // log('✅ Audio srcObject set');
+                    // log('✅ Audio element srcObject set');
                     
-                    // Prova a fare play
+                    // Play audio
                     audioOutRef.current.play()
-                        .then(() => log('▶️ Audio playing'))
+                        .then(() => {
+                            // log('▶️ Audio playing');
+                            // Setup analyzer direttamente con lo stream
+                            setupAudioAnalyzer(remoteStream);
+                        })
                         .catch(e => log(`⏸️ Audio play failed: ${e}`));
-                    
-                    // Setup analyzer DOPO aver settato srcObject
-                    setTimeout(() => {
-                        log('⏰ Starting analyzer setup...');
-                        setupAudioAnalyzer();
-                    }, 500);
                 }
             };
 
@@ -263,11 +311,10 @@ export default function RealtimeClient() {
             remoteStreamRef.current?.getTracks().forEach(t => t.stop());
             
             // Pulisci audio context
-            if (audioContextRef.current) {
+            if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
                 audioContextRef.current.close();
                 audioContextRef.current = null;
             }
-            analyserRef.current = null;
         } finally {
             dcRef.current = null;
             pcRef.current = null;
@@ -304,7 +351,7 @@ export default function RealtimeClient() {
         dc.send(JSON.stringify(msg));
     }, []);
 
-    // NON serve più ascoltare gli eventi play/pause/ended
+    // Cleanup on unmount
     useEffect(() => {
         return () => {
             try { 
@@ -316,8 +363,8 @@ export default function RealtimeClient() {
 
     return (
         <div className='text-neutral-100 flex flex-col items-center justify-center ' style={{ display: 'grid', gap: 8 }}>
-            <div className='flex mt-8 gap-x-8 items-center justify-center'  >
-                <button className='border w-32 border-green-800 rounded-lg p-4 '
+            <div className='flex mt-8 gap-x-8 items-center justify-center'>
+                <button className='border bg-blue-800/20 w-32 border-blue-800 rounded-lg p-4'
                     onClick={() =>
                         connect({
                             enableMicrophone: true,
@@ -328,35 +375,10 @@ export default function RealtimeClient() {
                 >
                     Connetti
                 </button>
-                <button className='border w-32 border-red-800 rounded-lg p-4 ' onClick={disconnect} disabled={!connected}>
+                <button className='border bg-red-800/20 w-32 border-red-800 rounded-lg p-4' onClick={disconnect} disabled={!connected}>
                     Disconnetti
                 </button>
-                {/* <button
-                    onClick={() => {
-                        const t = prompt('Scrivi un prompt testuale', 'Dimmi una curiosità sulle stelle');
-                        if (t) {
-                            setTranscript('');
-                            sendUserText(t);
-                        }
-                    }}
-                    disabled={!connected}
-                >
-                    Send text
-                </button> */}
-                {/* <button
-                    onClick={() => {
-                        const t = prompt('Prompt voce (audio out)', 'Raccontami una barzelletta');
-                        if (t) startVoiceResponse(t);
-                    }}
-                    disabled={!connected}
-                >
-                    Voice reply
-                </button> */}
             </div>
-
-            {/* <div style={{ fontFamily: 'monospace', whiteSpace: 'pre-wrap', padding: 8, border: '1px solid #ddd', borderRadius: 6 }}>
-                {transcript || 'Output testuale progressivo...'}
-            </div> */}
 
             <audio className='-z-999' ref={audioOutRef} autoPlay controls />
 

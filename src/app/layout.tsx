@@ -28,7 +28,7 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        <div className="z-[-50] fixed w-[100vw] bg-stone-950 h-[100lvh]" >
+        <div className="z-[-50] fixed w-[100vw] bg-stone-950 h-[100svh]" >
           <GLWrapper />
         </div>
         {children}
