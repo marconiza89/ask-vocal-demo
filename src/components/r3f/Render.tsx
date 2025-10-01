@@ -2,14 +2,34 @@
 import { Canvas, useFrame, extend } from "@react-three/fiber";
 import { type ThreeElement } from '@react-three/fiber'
 import { Suspense, useEffect, useRef, useState } from "react";
-import { OrbitControls } from "@react-three/drei";
+import { OrbitControls, Sphere, MeshDistortMaterial, Environment } from "@react-three/drei";
+import { AudioBlob } from "./AudioBlob";
 
 // import { Effects } from "./Effects";
 
 // Estendi per React Three Fiber
 
 
+function DistortedTorusBG() {
+ 
+  return (
+    <Sphere     
+      castShadow
+      receiveShadow     
+      args={[1.5, 128, 128]}
+      position={[0, 0, 0]}
+    >
+      <MeshDistortMaterial
+        color="#04114b"
+        distort={0.45}
+        speed={0.9}
+        roughness={0.8}
+        metalness={0.0}
 
+      />
+    </Sphere>
+  );
+}
 
 
 
@@ -29,13 +49,11 @@ export  function Render() {
             >
                 <Suspense fallback={null}>
                     <OrbitControls enableDamping dampingFactor={0.05} />
-                    
+                    <Environment preset="city" />
                     <ambientLight intensity={0.3} />
                     <pointLight position={[10, 10, 10]} intensity={0.5} />
-                    <mesh>
-                        <boxGeometry args={[2, 2, 2]} />
-                        <meshStandardMaterial color="orange"  />
-                    </mesh>
+                    {/* <AudioBlob /> */}
+                    <DistortedTorusBG />
                     
                     <color attach="background" args={['#000011']} />
                     

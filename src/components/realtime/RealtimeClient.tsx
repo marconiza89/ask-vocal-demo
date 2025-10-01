@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useAudioStore } from '../r3f/UseAudio';
 
 type RealtimeEvent = {
     type: string;
@@ -9,8 +10,8 @@ type RealtimeEvent = {
 
 type ConnectOptions = {
     model?: string;
-    enableMicrophone?: boolean; // se true, invia audio al modello
-    enableAudioOut?: boolean;   // se true, riproduce l'audio del modello
+    enableMicrophone?: boolean;
+    enableAudioOut?: boolean;
 };
 
 export default function RealtimeClient() {
@@ -22,10 +23,103 @@ export default function RealtimeClient() {
     const localStreamRef = useRef<MediaStream | null>(null);
     const remoteStreamRef = useRef<MediaStream | null>(null);
     const audioOutRef = useRef<HTMLAudioElement | null>(null);
+    
+    // Audio analysis refs
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const analyserRef = useRef<AnalyserNode | null>(null);
+    const animationFrameRef = useRef<number | null>(null);
+    const setAudioLevel = useAudioStore((state) => state.setAudioLevel);
 
     const log = useCallback((m: string) => {
         setLogs(prev => [m, ...prev].slice(0, 200));
     }, []);
+
+    // Setup audio analyzer - chiamato DOPO che WebRTC è connesso
+    const setupAudioAnalyzer = useCallback(async () => {
+        // Aspetta che ci sia un srcObject valido
+        if (!audioOutRef.current?.srcObject) {
+            log('❌ No srcObject yet, retrying...');
+            setTimeout(() => setupAudioAnalyzer(), 100);
+            return;
+        }
+        
+        // Se analyzer già esiste, non ricreare
+        if (analyserRef.current) {
+            log('⚠️ Analyzer already exists');
+            return;
+        }
+
+        try {
+            log('🎤 Creating audio analyzer...');
+            
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            audioContextRef.current = audioContext;
+            log(`🔊 AudioContext state: ${audioContext.state}`);
+
+            // Resume context se sospeso
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+                // log('✅ AudioContext resumed');
+            }
+
+            const analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048; // Più grande per time domain
+            analyser.smoothingTimeConstant = 0.8;
+            analyserRef.current = analyser;
+
+            // Crea source dall'elemento audio
+            const source = audioContext.createMediaElementSource(audioOutRef.current);
+            source.connect(analyser);
+            analyser.connect(audioContext.destination);
+            
+            // log('✅ Audio analyzer connected!');
+
+            const bufferLength = analyser.fftSize;
+            const dataArray = new Uint8Array(bufferLength);
+            let frameCount = 0;
+
+            const updateVolume = () => {
+                if (!analyserRef.current) return;
+                
+                // Usa time domain invece di frequency
+                analyserRef.current.getByteTimeDomainData(dataArray);
+                
+                // Calcola RMS (Root Mean Square) per volume più accurato
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) {
+                    const normalized = (dataArray[i] - 128) / 128; // Normalizza a -1 to 1
+                    sum += normalized * normalized;
+                }
+                const rms = Math.sqrt(sum / dataArray.length);
+                
+                // Log dettagliato ogni 30 frame (circa 0.5 secondi)
+                // if (frameCount++ % 30 === 0) {
+                //     log(`📊 Time domain - RMS: ${rms.toFixed(3)}, First values: ${dataArray[0]}, ${dataArray[1]}, ${dataArray[2]}`);
+                // }
+                
+                // Scala il volume (RMS è di solito tra 0 e 0.5 per parlato normale)
+                const normalizedVolume = Math.min(1, rms * 3);
+                
+                // Aggiorna store
+                setAudioLevel(normalizedVolume);
+                
+                animationFrameRef.current = requestAnimationFrame(updateVolume);
+            };
+
+            updateVolume();
+            // log('🎯 Volume monitoring active');
+        } catch (error) {
+            log(`❌ Audio analyzer error: ${error}`);
+        }
+    }, [log, setAudioLevel]);
+
+    const stopAudioAnalyzer = useCallback(() => {
+        if (animationFrameRef.current !== null) {
+            cancelAnimationFrame(animationFrameRef.current);
+            animationFrameRef.current = null;
+        }
+        setAudioLevel(0);
+    }, [setAudioLevel]);
 
     const fetchEphemeralSession = useCallback(async (model?: string) => {
         const url = model ? `/api/realtime/session?model=${encodeURIComponent(model)}` : '/api/realtime/session';
@@ -72,8 +166,6 @@ export default function RealtimeClient() {
             try {
                 const evt: RealtimeEvent = JSON.parse(e.data);
 
-                // testo: copri sia response.delta con delta.type === 'output_text'
-                // sia response.output_text.delta
                 if (evt.type === 'response.delta' && evt.delta?.type === 'output_text') {
                     setTranscript(prev => prev + (evt.delta.text || ''));
                 } else if (evt.type === 'response.output_text.delta') {
@@ -94,17 +186,33 @@ export default function RealtimeClient() {
             const remoteStream = new MediaStream();
             remoteStreamRef.current = remoteStream;
             pc.ontrack = (event) => {
+                log('🎵 Received audio track from WebRTC');
                 const [stream] = event.streams;
-                stream.getAudioTracks().forEach(track => remoteStream.addTrack(track));
+                const tracks = stream.getAudioTracks();
+                log(`📡 Number of audio tracks: ${tracks.length}`);
+                
+                tracks.forEach(track => {
+                    remoteStream.addTrack(track);
+                    log(`🎧 Track state: ${track.readyState}, enabled: ${track.enabled}`);
+                });
+                
                 if (audioOutRef.current) {
                     audioOutRef.current.srcObject = remoteStream;
-                    audioOutRef.current.play().catch(() => {
-                        // se il browser blocca l’autoplay, l’utente può usare i controls
-                    });
+                    // log('✅ Audio srcObject set');
+                    
+                    // Prova a fare play
+                    audioOutRef.current.play()
+                        .then(() => log('▶️ Audio playing'))
+                        .catch(e => log(`⏸️ Audio play failed: ${e}`));
+                    
+                    // Setup analyzer DOPO aver settato srcObject
+                    setTimeout(() => {
+                        log('⏰ Starting analyzer setup...');
+                        setupAudioAnalyzer();
+                    }, 500);
                 }
             };
 
-            // garantisce m=audio per ricezione
             pc.addTransceiver('audio', { direction: 'recvonly' });
         }
 
@@ -115,16 +223,14 @@ export default function RealtimeClient() {
             local.getTracks().forEach(track => pc.addTrack(track, local));
         }
 
-        // Se non abbiamo né mic né audio out, aggiungiamo comunque un transceiver audio
+        // Se non abbiamo né mic né audio out
         if (!enableMicrophone && !enableAudioOut) {
             pc.addTransceiver('audio', { direction: 'recvonly' });
         }
 
-        // Crea SDP offer (senza opzioni deprecate)
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        // Scambio SDP con OpenAI Realtime
         const modelForUrl = encodeURIComponent(session?.model || model || 'gpt-4o-realtime-preview-2024-12-17');
         const resp = await fetch(`https://api.openai.com/v1/realtime?model=${modelForUrl}`, {
             method: 'POST',
@@ -145,15 +251,23 @@ export default function RealtimeClient() {
         await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
 
         log('WebRTC connected');
-    }, [fetchEphemeralSession, log]);
+    }, [fetchEphemeralSession, log, setupAudioAnalyzer]);
 
     const disconnect = useCallback(() => {
         try {
+            stopAudioAnalyzer();
             dcRef.current?.close();
             pcRef.current?.getSenders().forEach(s => s.track?.stop());
             pcRef.current?.close();
             localStreamRef.current?.getTracks().forEach(t => t.stop());
             remoteStreamRef.current?.getTracks().forEach(t => t.stop());
+            
+            // Pulisci audio context
+            if (audioContextRef.current) {
+                audioContextRef.current.close();
+                audioContextRef.current = null;
+            }
+            analyserRef.current = null;
         } finally {
             dcRef.current = null;
             pcRef.current = null;
@@ -162,12 +276,11 @@ export default function RealtimeClient() {
             setConnected(false);
             log('Disconnected');
         }
-    }, [log]);
+    }, [log, stopAudioAnalyzer]);
 
     const sendUserText = useCallback((text: string) => {
         const dc = dcRef.current;
         if (!dc || dc.readyState !== 'open') return;
-        // Invia una richiesta di risposta testuale
         const msg = {
             type: 'response.create',
             response: {
@@ -191,31 +304,34 @@ export default function RealtimeClient() {
         dc.send(JSON.stringify(msg));
     }, []);
 
+    // NON serve più ascoltare gli eventi play/pause/ended
     useEffect(() => {
         return () => {
-            // cleanup on unmount
-            try { disconnect(); } catch { }
+            try { 
+                stopAudioAnalyzer();
+                disconnect(); 
+            } catch { }
         };
-    }, [disconnect]);
+    }, [disconnect, stopAudioAnalyzer]);
 
     return (
-        <div className='' style={{ display: 'grid', gap: 8 }}>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <button
+        <div className='text-neutral-100 flex flex-col items-center justify-center ' style={{ display: 'grid', gap: 8 }}>
+            <div className='flex mt-8 gap-x-8 items-center justify-center'  >
+                <button className='border w-32 border-green-800 rounded-lg p-4 '
                     onClick={() =>
                         connect({
-                            enableMicrophone: true,  // metti true per voce in
-                            enableAudioOut: true,    // metti true per voce out
+                            enableMicrophone: true,
+                            enableAudioOut: true,
                         }).catch(e => log(String(e)))
                     }
                     disabled={connected}
                 >
-                    Connect
+                    Connetti
                 </button>
-                <button onClick={disconnect} disabled={!connected}>
-                    Disconnect
+                <button className='border w-32 border-red-800 rounded-lg p-4 ' onClick={disconnect} disabled={!connected}>
+                    Disconnetti
                 </button>
-                <button
+                {/* <button
                     onClick={() => {
                         const t = prompt('Scrivi un prompt testuale', 'Dimmi una curiosità sulle stelle');
                         if (t) {
@@ -226,23 +342,23 @@ export default function RealtimeClient() {
                     disabled={!connected}
                 >
                     Send text
-                </button>
-                <button
+                </button> */}
+                {/* <button
                     onClick={() => {
-                        const t = prompt('Prompt voce (audio out, richiede connect con enableAudioOut=true)', 'Raccontami una barzelletta');
+                        const t = prompt('Prompt voce (audio out)', 'Raccontami una barzelletta');
                         if (t) startVoiceResponse(t);
                     }}
                     disabled={!connected}
                 >
                     Voice reply
-                </button>
+                </button> */}
             </div>
 
-            <div style={{ fontFamily: 'monospace', whiteSpace: 'pre-wrap', padding: 8, border: '1px solid #ddd', borderRadius: 6 }}>
+            {/* <div style={{ fontFamily: 'monospace', whiteSpace: 'pre-wrap', padding: 8, border: '1px solid #ddd', borderRadius: 6 }}>
                 {transcript || 'Output testuale progressivo...'}
-            </div>
+            </div> */}
 
-            <audio ref={audioOutRef} autoPlay controls />
+            <audio className='-z-999' ref={audioOutRef} autoPlay controls />
 
             <div style={{ fontFamily: 'monospace', fontSize: 12, opacity: 0.8 }}>
                 {logs.map((l, i) => (
